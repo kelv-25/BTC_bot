@@ -4,8 +4,8 @@ import requests
 import threading
 from flask import Flask
 
-TELEGRAM_TOKEN = os.environ.get("8819205021:AAGKa6sArG1SJhygc-Zq3cVFE0khtRUA27o")
-CHAT_ID = os.environ.get("7711171228")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
 LEVERAGE = 10
 
 in_trade = False
