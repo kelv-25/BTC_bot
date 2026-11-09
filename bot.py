@@ -1,137 +1,105 @@
-import os
-import time
-import requests
-import threading
-from flask import Flask
+import os, time, requests, asyncio
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-LEVERAGE = 10
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = int(os.getenv("CHAT_ID", "0"))
 
-in_trade = False
-entry_price = 0
-side = ""
-last_price = 0
-last_rsi = 0
-cooldown_until = 0
-surge_locks = 0
-drop_locks = 0
+# PAPER TRADING SETTINGS
+balance = 1000.0  # Starting fake USDT
+btc_held = 0.0
+entry_price = 0.0
+history = []
+last_price = None
+ref_price = None
+last_trade_time = 0
+PAUSE = 12 * 60  # 12 min pause
 
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return f"Bot Alive. Price: {last_price} RSI: {last_rsi} In Trade: {in_trade} {side} Surge Locks: {surge_locks} Drop Locks: {drop_locks}"
-
-def send_telegram(msg):
+def get_btc():
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
+        r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=10)
+        return float(r.json()["price"])
     except:
-        print("Telegram failed")
+        return None
 
-def get_data():
-    global last_price, last_rsi
+async def send_msg(app, text):
     try:
-        url = "https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=5m&limit=100"
-        data = requests.get(url, timeout=10).json()
-        closes = [float(c[4]) for c in data]
-        price = closes[-1]
-        price_5m_ago = closes[-2]
-        ema50 = sum(closes[-50:]) / 50
-        ema200 = sum(closes[-100:]) / 100
-        gains = [max(0, closes[i]-closes[i-1]) for i in range(1, len(closes))]
-        losses = [max(0, closes[i-1]-closes[i]) for i in range(1, len(closes))]
-        avg_gain = sum(gains[-14:]) / 14
-        avg_loss = sum(losses[-14:]) / 14
-        rsi = 100 if avg_loss == 0 else 100 - (100 / (1 + (avg_gain / avg_loss)))
-        last_price, last_rsi = price, round(rsi,1)
-        return price, rsi, ema50, ema200, price_5m_ago
-    except:
-        print("Price fetch failed")
-        return None, None, None, None, None
+        await app.bot.send_message(chat_id=CHAT_ID, text=text)
+    except Exception as e:
+        print("Send error:", e)
 
-def bot_loop():
-    global in_trade, entry_price, side, cooldown_until, surge_locks, drop_locks
-    send_telegram("Bot Started - AUTO + 1% SURGE LOCK + 1% DROP LOCK + 12 MIN PAUSE - BTC/USDT 5m - PAPER MODE")
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🤖 Paper Trading Bot LIVE\nBalance: $1000\nRisk: 10% per trade\nCommands: /balance /position /history")
+
+async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    total = balance + (btc_held * (last_price or 0))
+    await update.message.reply_text(f"💰 PAPER BALANCE\n\nCash: ${balance:.2f}\nBTC Held: {btc_held:.6f} BTC\nCurrent Price: ${last_price}\nTotal Value: ${total:.2f}\nProfit: ${total-1000:.2f}")
+
+async def position_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if btc_held > 0:
+        pnl = (last_price - entry_price) / entry_price * 100 if entry_price else 0
+        await update.message.reply_text(f"📈 IN POSITION\nBought at: ${entry_price:.2f}\nNow: ${last_price:.2f}\nPnL: {pnl:.2f}%")
+    else:
+        await update.message.reply_text("📭 No position - Waiting for signal. Cash ready.")
+
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not history:
+        await update.message.reply_text("No trades yet.")
+        return
+    txt = "📜 LAST TRADES:\n\n" + "\n".join(history[-10:])
+    await update.message.reply_text(txt)
+
+async def trading_loop(app):
+    global balance, btc_held, entry_price, last_price, ref_price, last_trade_time
+    await send_msg(app, "🤖 Bot Started - PAPER TRADING\n💰 $1000 | 10% per trade\nAUTO + 1% SURGE LOCK + 1% DROP LOCK + 12 MIN PAUSE")
     while True:
-        price, rsi, ema50, ema200, price_5m_ago = get_data()
-        if price is None:
-            time.sleep(10)
-            continue
+        price = get_btc()
+        if price:
+            last_price = price
+            if ref_price is None:
+                ref_price = price
+            change = (price - ref_price) / ref_price * 100
+            now = time.time()
+            # SURGE +1% -> BUY if not holding and pause over
+            if change >= 1.0 and btc_held == 0 and (now - last_trade_time > PAUSE):
+                amount_usdt = balance * 0.10
+                btc_held = amount_usdt / price
+                balance -= amount_usdt
+                entry_price = price
+                last_trade_time = now
+                ref_price = price
+                msg = f"🟢 SURGE LOCK +1% - PAPER BUY\nBought {btc_held:.6f} BTC @ ${price:.2f}\nSpent: ${amount_usdt:.2f}\nCash Left: ${balance:.2f}"
+                history.append(f"BUY {btc_held:.4f} @ {price:.0f}")
+                await send_msg(app, msg)
+            # DROP -1% or Take Profit +1.5% -> SELL if holding
+            elif btc_held > 0:
+                pnl_pct = (price - entry_price) / entry_price * 100
+                if change <= -1.0 or pnl_pct >= 1.5:
+                    sell_value = btc_held * price
+                    profit = sell_value - (btc_held * entry_price)
+                    balance += sell_value
+                    msg = f"🔴 SELL - PAPER TRADE CLOSED\nSold {btc_held:.6f} BTC @ ${price:.2f}\nProfit: ${profit:.2f}\nNew Balance: ${balance:.2f}"
+                    history.append(f"SELL @ {price:.0f} Profit ${profit:.2f}")
+                    btc_held = 0.0
+                    last_trade_time = now
+                    ref_price = price
+                    await send_msg(app, msg)
+                # Update ref if no trade for a while to avoid stale ref
+            if abs(change) < 0.2:
+                ref_price = price
+        await asyncio.sleep(30)
 
-        # --- 1% SINGLE CANDLE MOVE CHECK ---
-        move_5m = ((price - price_5m_ago) / price_5m_ago) * 100
-
-        # SURGE UP +1%
-        if move_5m >= 1.0:
-            surge_locks += 1
-            if in_trade:
-                if side == "LONG":
-                    move = ((price - entry_price) / entry_price) * 100
-                else:
-                    move = ((entry_price - price) / entry_price) * 100
-                profit = move * LEVERAGE
-                send_telegram(f"SURGE LOCK +1% ACTIVATED\nSingle candle: +{move_5m:.2f}%\nClosed {side} at {price}\nResult: {profit:.2f}% with 10x\nPaused 12 mins")
-                in_trade = False
-            else:
-                send_telegram(f"SURGE LOCK +1% ACTIVATED\nSingle candle: +{move_5m:.2f}%\nNo trade opened - Waiting 12 mins")
-            cooldown_until = time.time() + (12 * 60)
-            time.sleep(60)
-            continue
-
-        # DROP DOWN -1% - SINGLE DROP
-        if move_5m <= -1.0:
-            drop_locks += 1
-            if in_trade:
-                if side == "LONG":
-                    move = ((price - entry_price) / entry_price) * 100
-                else:
-                    move = ((entry_price - price) / entry_price) * 100
-                profit = move * LEVERAGE
-                send_telegram(f"DROP LOCK -1% ACTIVATED\nSingle drop: {move_5m:.2f}% in 5m\nClosed {side} at {price}\nResult: {profit:.2f}% with 10x\nPaused 12 mins - Not catching falling knife")
-                in_trade = False
-            else:
-                send_telegram(f"DROP LOCK -1% ACTIVATED\nSingle drop: {move_5m:.2f}% in 5m\nNo trade opened - Waiting 12 mins")
-            cooldown_until = time.time() + (12 * 60)
-            time.sleep(60)
-            continue
-
-        # --- COOLDOWN CHECK ---
-        if time.time() < cooldown_until:
-            remaining = int((cooldown_until - time.time()) / 60)
-            print(f"In Lock Cooldown - {remaining} mins left - Price: {price}")
-            time.sleep(60)
-            continue
-
-        print(f"Price: {price} | RSI: {rsi:.1f} | EMA50: {ema50:.0f} | EMA200: {ema200:.0f} | In Trade: {in_trade} | 5m Move: {move_5m:.2f}%")
-
-        # --- ONLY TRADE WHEN CLEARLY BULLISH OR BEARISH - WAIT WHEN SIDEWAYS ---
-        if not in_trade:
-            if ema50 > ema200 and rsi < 65:
-                in_trade, side, entry_price = True, "LONG", price
-                send_telegram(f"AUTO LONG ENTERED - BULLISH\nPrice: {price}\nRSI: {rsi:.1f}\nTP: +0.4% | SL: -0.4% | Surge Lock: +1% | Drop Lock: -1%")
-            elif ema50 < ema200 and rsi > 35:
-                in_trade, side, entry_price = True, "SHORT", price
-                send_telegram(f"AUTO SHORT ENTERED - BEARISH\nPrice: {price}\nRSI: {rsi:.1f}\nTP: +0.4% | SL: -0.4% | Surge Lock: +1% | Drop Lock: -1%")
-
-        if in_trade:
-            if side == "LONG":
-                move = ((price - entry_price) / entry_price) * 100
-            else:
-                move = ((entry_price - price) / entry_price) * 100
-            profit = move * LEVERAGE
-            if move >= 0.4:
-                send_telegram(f"PROFIT LOCK! {side}\nExit: {price}\nProfit: {profit:.2f}% with 10x")
-                in_trade = False
-            elif move <= -0.4:
-                send_telegram(f"STOP LOSS! {side}\nExit: {price}\nLoss: {profit:.2f}% with 10x")
-                in_trade = False
-
-        time.sleep(60)
-
-threading.Thread(target=bot_loop, daemon=True).start()
+async def main():
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("balance", balance_cmd))
+    app.add_handler(CommandHandler("position", position_cmd))
+    app.add_handler(CommandHandler("history", history_cmd))
+    asyncio.create_task(trading_loop(app))
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    asyncio.run(main())
