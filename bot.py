@@ -1,110 +1,119 @@
-import os, time, requests, threading
-from flask import Flask
+import time, requests, threading
 import telebot
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = int(os.getenv("CHAT_ID", "0"))
-PORT = int(os.getenv("PORT", 10000))
+TOKEN = "8819205021:AAFXlBuQ40mXY-EJwp-hME_UOVBpKc60Yjc"
+CHAT_ID = "7711171228"
 
 bot = telebot.TeleBot(TOKEN)
-app = Flask(__name__)
 
-@app.route('/')
-def home():
-    return "Bot is running!"
-
-# PAPER TRADING SETTINGS
 balance = 1000.0
-btc_held = 0.0
-entry_price = 0.0
+LEVERAGE = 10
+MARGIN_PER_TRADE = 100.0
+TRADEBACK = 0.002
+ENTRY_MOVE = 0.002
+
+position = None
 history = []
 last_price = None
-ref_price = None
-last_trade_time = 0
-PAUSE = 12 * 60
+prev_price_for_signal = None
 
 def get_btc():
-    # Try Coinbase first, then CoinGecko as backup
     try:
         r = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=10)
         return float(r.json()["data"]["amount"])
     except:
-        pass
-    try:
-        r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", timeout=10)
-        return float(r.json()["bitcoin"]["usd"])
-    except:
-        return None
+        try:
+            r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", timeout=10)
+            return float(r.json()["bitcoin"]["usd"])
+        except:
+            return None
 
-def send_msg(text):
-    try:
-        bot.send_message(CHAT_ID, text)
-    except Exception as e:
-        print("Send error:", e)
-
-@bot.message_handler(commands=['start'])
-def start_cmd(m):
-    bot.reply_to(m, "🤖 Paper Trading Bot LIVE\nBalance: $1000\nRisk: 10% per trade\nCommands: /balance /position /history")
-
-@bot.message_handler(commands=['balance'])
-def balance_cmd(m):
-    total = balance + (btc_held * (last_price or 0))
-    bot.reply_to(m, f"💰 PAPER BALANCE\n\nCash: ${balance:.2f}\nBTC Held: {btc_held:.6f}\nPrice: ${last_price}\nTotal: ${total:.2f}\nProfit: ${total-1000:.2f}")
-
-@bot.message_handler(commands=['position'])
-def position_cmd(m):
-    if btc_held > 0:
-        pnl = (last_price - entry_price) / entry_price * 100 if entry_price else 0
-        bot.reply_to(m, f"📈 IN POSITION\nBought at: ${entry_price:.2f}\nNow: ${last_price:.2f}\nPnL: {pnl:.2f}%")
+def close_position(price, reason):
+    global balance, position
+    if not position: return
+    entry = position['entry']
+    margin = position['margin']
+    if position['side'] == 'LONG':
+        pnl_pct = (price - entry) / entry
     else:
-        bot.reply_to(m, "📭 No position - Waiting for signal.")
-
-@bot.message_handler(commands=['history'])
-def history_cmd(m):
-    if not history:
-        bot.reply_to(m, "No trades yet.")
-    else:
-        bot.reply_to(m, "📜 LAST TRADES:\n\n" + "\n".join(history[-10:]))
+        pnl_pct = (entry - price) / entry
+    pnl = pnl_pct * margin * LEVERAGE
+    balance += pnl
+    msg = f"{'🟢' if pnl>=0 else '🔴'} CLOSED {position['side']} @ ${price:,.2f}\nEntry: ${entry:,.2f}\nPnL: ${pnl:+.2f}\nReason: {reason}\nBalance: ${balance:,.2f}"
+    history.append(msg)
+    bot.send_message(CHAT_ID, msg)
+    position = None
 
 def trading_loop():
-    global balance, btc_held, entry_price, last_price, ref_price, last_trade_time
-    send_msg("🤖 Bot Started - PAPER TRADING\n💰 $1000 | 10% per trade\nAUTO +1% SURGE LOCK +1% DROP LOCK + 12 MIN PAUSE")
+    global last_price, prev_price_for_signal, position
+    prev_price_for_signal = get_btc()
+    time.sleep(60)
     while True:
-        price = get_btc()
-        if price:
+        try:
+            price = get_btc()
+            if price is None:
+                time.sleep(10); continue
             last_price = price
-            if ref_price is None:
-                ref_price = price
-            change = (price - ref_price) / ref_price * 100
-            now = time.time()
-            if change >= 1.0 and btc_held == 0 and (now - last_trade_time > PAUSE):
-                amount = balance * 0.10
-                btc_held = amount / price
-                balance -= amount
-                entry_price = price
-                last_trade_time = now
-                ref_price = price
-                history.append(f"BUY {btc_held:.4f} @ {price:.0f}")
-                send_msg(f"🟢 SURGE LOCK +1% - PAPER BUY\nBought {btc_held:.6f} BTC @ ${price:.2f}\nSpent: ${amount:.2f}\nCash Left: ${balance:.2f}")
-            elif btc_held > 0:
-                pnl_pct = (price - entry_price) / entry_price * 100
-                if change <= -1.0 or pnl_pct >= 1.5:
-                    sell_value = btc_held * price
-                    profit = sell_value - (btc_held * entry_price)
-                    balance += sell_value
-                    history.append(f"SELL @ {price:.0f} Profit ${profit:.2f}")
-                    send_msg(f"🔴 SELL - PAPER TRADE CLOSED\nSold {btc_held:.6f} BTC @ ${price:.2f}\nProfit: ${profit:.2f}\nNew Balance: ${balance:.2f}")
-                    btc_held = 0.0
-                    last_trade_time = now
-                    ref_price = price
-            if abs(change) < 0.2:
-                ref_price = price
-        time.sleep(30)
+            if position is None:
+                if prev_price_for_signal:
+                    move = (price - prev_price_for_signal) / prev_price_for_signal
+                    if move >= ENTRY_MOVE:
+                        position = {'side':'LONG','entry':price,'best':price,'margin':MARGIN_PER_TRADE}
+                        bot.send_message(CHAT_ID, f"🟢 LONG OPEN @ ${price:,.2f}\nMargin $100 | 10x | Riding UP")
+                    elif move <= -ENTRY_MOVE:
+                        position = {'side':'SHORT','entry':price,'best':price,'margin':MARGIN_PER_TRADE}
+                        bot.send_message(CHAT_ID, f"🔴 SHORT OPEN @ ${price:,.2f}\nMargin $100 | 10x | Riding DOWN")
+                prev_price_for_signal = price
+            else:
+                if position['side'] == 'LONG':
+                    if price > position['best']:
+                        position['best'] = price
+                    pullback = (position['best'] - price) / position['best']
+                    profit = (price - position['entry']) / position['entry']
+                    if pullback >= TRADEBACK and profit > 0:
+                        close_position(price, f"Pulled back {pullback*100:.2f}% from peak")
+                        prev_price_for_signal = price
+                        time.sleep(120)
+                    elif profit <= -0.01:
+                        close_position(price, "Stop Loss -1%")
+                        prev_price_for_signal = price
+                        time.sleep(120)
+                else:
+                    if price < position['best']:
+                        position['best'] = price
+                    pullback = (price - position['best']) / position['best']
+                    profit = (position['entry'] - price) / position['entry']
+                    if pullback >= TRADEBACK and profit > 0:
+                        close_position(price, f"Bounced back {pullback*100:.2f}% from low")
+                        prev_price_for_signal = price
+                        time.sleep(120)
+                    elif profit <= -0.01:
+                        close_position(price, "Stop Loss -1%")
+                        prev_price_for_signal = price
+                        time.sleep(120)
+        except Exception as e:
+            print(f"Loop error: {e}")
+        time.sleep(10)
 
-def run_bot():
-    threading.Thread(target=trading_loop, daemon=True).start()
-    bot.infinity_polling()
+@bot.message_handler(commands=['start'])
+def start(m):
+    bot.reply_to(m, f"🤖 FUTURES SCALPER LIVE\n💰 ${balance:.2f} | 10x Leverage\nLONG/SHORT + Trailing Exit")
 
-if __name__ == "__main__":
-    threading.Thread(target=run_bot, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT)
+@bot.message_handler(commands=['balance'])
+def bal(m):
+    bot.reply_to(m, f"💰 FUTURES BALANCE\nCash: ${balance:.2f}\nPrice: ${last_price}\nPosition: {position}")
+
+@bot.message_handler(commands=['position'])
+def pos(m):
+    if position:
+        bot.reply_to(m, f"📊 {position['side']} @ ${position['entry']:,.2f}\nBest: ${position['best']:,.2f}\nNow: ${last_price}")
+    else:
+        bot.reply_to(m, "📭 No position - Waiting for 0.2% move")
+
+@bot.message_handler(commands=['history'])
+def hist(m):
+    bot.reply_to(m, "\n\n".join(history[-5:]) if history else "No trades yet")
+
+threading.Thread(target=trading_loop, daemon=True).start()
+bot.send_message(CHAT_ID, "🤖 Bot Started - FUTURES PAPER TRADING\n💰 $1000 | 10x | Trailing Exit")
+bot.polling(none_stop=True)
