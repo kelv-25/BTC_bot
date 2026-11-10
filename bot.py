@@ -1,9 +1,17 @@
 import os, time, requests, threading
+from flask import Flask
 import telebot
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = int(os.getenv("CHAT_ID", "0"))
+PORT = int(os.getenv("PORT", 10000))
+
 bot = telebot.TeleBot(TOKEN)
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running!"
 
 # PAPER TRADING SETTINGS
 balance = 1000.0
@@ -34,7 +42,6 @@ def start_cmd(m):
 
 @bot.message_handler(commands=['balance'])
 def balance_cmd(m):
-    global last_price
     total = balance + (btc_held * (last_price or 0))
     bot.reply_to(m, f"💰 PAPER BALANCE\n\nCash: ${balance:.2f}\nBTC Held: {btc_held:.6f}\nPrice: ${last_price}\nTotal: ${total:.2f}\nProfit: ${total-1000:.2f}")
 
@@ -88,6 +95,10 @@ def trading_loop():
                 ref_price = price
         time.sleep(30)
 
-threading.Thread(target=trading_loop, daemon=True).start()
-print("Bot polling...")
-bot.infinity_polling()
+def run_bot():
+    threading.Thread(target=trading_loop, daemon=True).start()
+    bot.infinity_polling()
+
+if __name__ == "__main__":
+    threading.Thread(target=run_bot, daemon=True).start()
+    app.run(host="0.0.0.0", port=PORT)
