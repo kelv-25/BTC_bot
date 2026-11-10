@@ -1,115 +1,108 @@
 import os
 import time
-import threading
 import requests
+import threading
 from flask import Flask
 
 # --- CONFIG ---
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+BASE = f"https://api.telegram.org/bot{TOKEN}" if TOKEN else ""
 
-ENTRY_TRIGGER = 0.0015  # 0.15% - entry
-TAKE_PROFIT_PULLBACK = 0.0015  # 0.15% - pullback to close
-STOP_LOSS = 0.003  # 0.3% stop loss
-SYMBOL = "BTCUSDT"
+print(f"=== BOT STARTING ===", flush=True)
+print(f"TOKEN found: {'YES' if TOKEN else 'NO - CHECK RENDER ENV!'}", flush=True)
+print(f"CHAT_ID: {CHAT_ID}", flush=True)
 
 app = Flask(__name__)
 
+@app.route('/')
+def home():
+    return "Bot is alive!", 200
+
 running = False
-in_trade = False
-entry_price = 0
-peak_price = 0
+last_price = None
 
 def send_telegram(text):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
+    if not TOKEN or not CHAT_ID:
+        print("CANNOT SEND: TOKEN or CHAT_ID missing!", flush=True)
         return
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=10)
+        r = requests.post(f"{BASE}/sendMessage", json={"chat_id": CHAT_ID, "text": text}, timeout=10)
+        print(f"Telegram send: {r.status_code} - {r.text[:200]}", flush=True)
     except Exception as e:
-        print(f"Telegram error: {e}")
+        print(f"Telegram send error: {e}", flush=True)
 
 def get_price():
     try:
-        r = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={SYMBOL}", timeout=10)
-        return float(r.json()["price"])
-    except:
+        r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=10)
+        return float(r.json()['price'])
+    except Exception as e:
+        print(f"Price error: {e}", flush=True)
         return None
 
 def trading_loop():
-    global running, in_trade, entry_price, peak_price
-    last_price = get_price()
-    if not last_price:
-        return
-    send_telegram(f"Bot started...\nWaiting for 0.15% move on {SYMBOL}...")
-    while True:
-        if not running:
-            time.sleep(2)
-            continue
-        price = get_price()
-        if not price:
-            time.sleep(2)
-            continue
-
-        if not in_trade:
-            # Check for 0.15% up move
-            if price >= last_price * (1 + ENTRY_TRIGGER):
-                in_trade = True
-                entry_price = price
-                peak_price = price
-                send_telegram(f"🟢 ENTER LONG @ ${price:,.2f}\nWaiting for 0.15% pullback to take profit...")
-            # Check for 0.15% down move
-            elif price <= last_price * (1 - ENTRY_TRIGGER):
-                in_trade = True
-                entry_price = price
-                peak_price = price
-                send_telegram(f"🔴 ENTER SHORT @ ${price:,.2f}\nWaiting for 0.15% pullback to take profit...")
-        else:
-            # Update peak and check pullback / stop
-            if price > peak_price:
-                peak_price = price
-            # Take profit on 0.15% pullback from peak
-            if price <= peak_price * (1 - TAKE_PROFIT_PULLBACK):
-                profit_pct = ((price - entry_price) / entry_price) * 100
-                send_telegram(f"✅ CLOSED @ ${price:,.2f}\nProfit: {profit_pct:.3f}%")
-                in_trade = False
-            elif price <= entry_price * (1 - STOP_LOSS):
-                send_telegram(f"🛑 STOP LOSS @ ${price:,.2f}")
-                in_trade = False
-
-        last_price = price
-        time.sleep(2)
-
-def telegram_polling():
-    global running
-    offset = 0
+    global last_price
+    time.sleep(3)
+    # 1. Clear old webhook - THIS IS THE FIX
+    try:
+        requests.get(f"{BASE}/deleteWebhook?drop_pending_updates=true", timeout=10)
+        print("Webhook deleted - polling can now work", flush=True)
+    except Exception as e:
+        print(f"Webhook delete error: {e}", flush=True)
+    
+    send_telegram("Bot started... Waiting for 0.15% move...")
+    print("Startup message sent, entering loop", flush=True)
+    
     while True:
         try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={offset}&timeout=30"
-            r = requests.get(url, timeout=35).json()
-            for upd in r.get("result", []):
+            if running:
+                price = get_price()
+                if price and last_price:
+                    change = ((price - last_price) / last_price) * 100
+                    if abs(change) >= 0.15:
+                        send_telegram(f"BTC moved {change:.3f}% - Price: {price}")
+                        last_price = price
+                if price:
+                    last_price = price
+            time.sleep(5)
+        except Exception as e:
+            print(f"Trading loop error: {e}", flush=True)
+            time.sleep(5)
+
+def polling_loop():
+    offset = None
+    print("Polling started - waiting for /start", flush=True)
+    while True:
+        try:
+            url = f"{BASE}/getUpdates?timeout=30"
+            if offset:
+                url += f"&offset={offset}"
+            r = requests.get(url, timeout=35)
+            data = r.json()
+            if not data.get("ok"):
+                print(f"Polling bad response: {data}", flush=True)
+                time.sleep(5)
+                continue
+            for upd in data.get("result", []):
                 offset = upd["update_id"] + 1
                 msg = upd.get("message", {})
                 text = msg.get("text", "")
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                print(f"Got message: '{text}' from {chat_id}", flush=True)
                 if text == "/start":
+                    global running
                     running = True
-                    send_telegram("Bot started...\nWaiting for 0.15% move on BTC...")
+                    send_telegram("Bot started... Waiting for 0.15% move...")
                 elif text == "/stop":
                     running = False
                     send_telegram("Bot stopped.")
-                elif text == "/status":
-                    price = get_price()
-                    send_telegram(f"Status: {'Running' if running else 'Stopped'}\nIn Trade: {in_trade}\nBTC: ${price:,.2f}" if price else "Status check failed")
         except Exception as e:
-            print(f"Polling error: {e}")
+            print(f"Polling error: {e}", flush=True)
             time.sleep(5)
 
-@app.route("/")
-def home():
-    return "Bot is alive"
+threading.Thread(target=trading_loop, daemon=True).start()
+threading.Thread(target=polling_loop, daemon=True).start()
 
 if __name__ == "__main__":
-    threading.Thread(target=telegram_polling, daemon=True).start()
-    threading.Thread(target=trading_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
