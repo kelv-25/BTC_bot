@@ -4,18 +4,15 @@ import requests
 import threading
 import telebot
 
-# --- SECRETS FROM RENDER ENVIRONMENT (NOT IN CODE) ---
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = int(os.getenv("CHAT_ID", "0"))
-
 bot = telebot.TeleBot(TOKEN)
 
-# --- PAPER FUTURES ACCOUNT ---
 balance = 1000.0
 LEVERAGE = 10
-MARGIN_PER_TRADE = 100.0  # $100 margin = $1000 notional with 10x
-TRADEBACK = 0.002  # 0.2% pullback from peak = CLOSE
-ENTRY_MOVE = 0.002  # 0.2% move in 60 sec = ENTER
+MARGIN_PER_TRADE = 100.0
+TRADEBACK = 0.002
+ENTRY_MOVE = 0.002
 
 position = None
 history = []
@@ -37,15 +34,15 @@ def close_position(price, reason):
     global balance, position
     if not position:
         return
-    entry = position['entry']
-    margin = position['margin']
-    if position['side'] == 'LONG':
+    entry = position["entry"]
+    margin = position["margin"]
+    if position["side"] == "LONG":
         pnl_pct = (price - entry) / entry
     else:
         pnl_pct = (entry - price) / entry
     pnl = pnl_pct * margin * LEVERAGE
     balance += pnl
-    msg = f"{'🟢' if pnl >= 0 else '🔴'} CLOSED {position['side']} @ ${price:,.2f}\nEntry: ${entry:,.2f}\nPnL: ${pnl:+.2f}\nReason: {reason}\nBalance: ${balance:,.2f}"
+    msg = "CLOSED " + position["side"] + " at " + str(round(price, 2)) + " PnL " + str(round(pnl, 2)) + " Reason " + reason + " Balance " + str(round(balance, 2))
     history.append(msg)
     bot.send_message(CHAT_ID, msg)
     position = None
@@ -61,22 +58,69 @@ def trading_loop():
                 time.sleep(10)
                 continue
             last_price = price
-
-            # --- NO POSITION: LOOK FOR ENTRY ---
             if position is None:
                 if prev_price_for_signal:
                     move = (price - prev_price_for_signal) / prev_price_for_signal
                     if move >= ENTRY_MOVE:
-                        position = {'side': 'LONG', 'entry': price, 'best': price, 'margin': MARGIN_PER_TRADE}
-                        bot.send_message(CHAT_ID, f"🟢 LONG OPEN @ ${price:,.2f}\nMargin $100 | 10x | Riding UP - Will close on first pullback")
+                        position = {"side": "LONG", "entry": price, "best": price, "margin": MARGIN_PER_TRADE}
+                        bot.send_message(CHAT_ID, "LONG OPEN at " + str(round(price, 2)) + " Margin 100 10x")
                     elif move <= -ENTRY_MOVE:
-                        position = {'side': 'SHORT', 'entry': price, 'best': price, 'margin': MARGIN_PER_TRADE}
-                        bot.send_message(CHAT_ID, f"🔴 SHORT OPEN @ ${price:,.2f}\nMargin $100 | 10x | Riding DOWN - Will close on first bounce")
+                        position = {"side": "SHORT", "entry": price, "best": price, "margin": MARGIN_PER_TRADE}
+                        bot.send_message(CHAT_ID, "SHORT OPEN at " + str(round(price, 2)) + " Margin 100 10x")
                 prev_price_for_signal = price
-
-            # --- IN POSITION: TRAILING EXIT ---
             else:
-                if position['side'] == 'LONG':
-                    if price > position['best']:
-                        position['best'] = price
-                    pullback = (position['best'] -
+                if position["side"] == "LONG":
+                    if price > position["best"]:
+                        position["best"] = price
+                    pullback = (position["best"] - price) / position["best"]
+                    profit = (price - position["entry"]) / position["entry"]
+                    if pullback >= TRADEBACK and profit > 0:
+                        close_position(price, "Pulled back from peak")
+                        prev_price_for_signal = price
+                        time.sleep(120)
+                    elif profit <= -0.01:
+                        close_position(price, "Stop Loss -1 pct")
+                        prev_price_for_signal = price
+                        time.sleep(120)
+                else:
+                    if price < position["best"]:
+                        position["best"] = price
+                    pullback = (price - position["best"]) / position["best"]
+                    profit = (position["entry"] - price) / position["entry"]
+                    if pullback >= TRADEBACK and profit > 0:
+                        close_position(price, "Bounced from low")
+                        prev_price_for_signal = price
+                        time.sleep(120)
+                    elif profit <= -0.01:
+                        close_position(price, "Stop Loss -1 pct")
+                        prev_price_for_signal = price
+                        time.sleep(120)
+        except Exception as e:
+            print("Loop error: " + str(e))
+        time.sleep(10)
+
+@bot.message_handler(commands=["start"])
+def start(m):
+    bot.reply_to(m, "FUTURES SCALPER LIVE Balance " + str(round(balance, 2)) + " 10x")
+
+@bot.message_handler(commands=["balance"])
+def bal(m):
+    bot.reply_to(m, "Balance " + str(round(balance, 2)) + " Price " + str(last_price))
+
+@bot.message_handler(commands=["position"])
+def pos(m):
+    if position:
+        bot.reply_to(m, "Position " + str(position))
+    else:
+        bot.reply_to(m, "No position - Waiting for 0.2 pct move")
+
+@bot.message_handler(commands=["history"])
+def hist(m):
+    if history:
+        bot.reply_to(m, "\n".join(history[-5:]))
+    else:
+        bot.reply_to(m, "No trades yet")
+
+threading.Thread(target=trading_loop, daemon=True).start()
+bot.send_message(CHAT_ID, "Bot Started - FUTURES PAPER TRADING 1000 USD 10x")
+bot.polling(none_stop=True)
